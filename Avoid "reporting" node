@@ -1,0 +1,44 @@
+$busynode = data.get( "busynode" );
+if( $busynode != "" ) {
+   request.avoidNode( connection.getNode() );
+ #unless session persistence mandates it, or unless there are no other nodes available.
+}
+
+
+#vTM User/Pass for REST API
+$user = "admin";
+$pass= "admin";
+#Path for the report 
+$report = "/report.html";
+
+$path = http.getpath();
+$rulestate = rule.getstate();
+
+#check the path and rule type
+if( $path == $report && $rulestate == "REQUEST" ){
+   #list active nodes.   
+   $nodes = pool.listActiveNodes("Traffic Script Web Servers");
+   #widget only fix for localhost, not for production 
+   $nodes = [ "localhost:8080", "localhost:8081" ];
+   
+   $counts = [];   
+   
+   #get the API data for each node
+   foreach( $node in $nodes ) {
+      $apidata = json.deserialize(http.request.get( "http://127.0.0.1:9070/api/tm/3.9/status/local_tm/statistics/nodes/node/".$node."/",
+      "Authorization:Basic ".string.base64encode( $user.":".$pass ))) ;
+      $nodeconcount  = $apidata['statistics']['current_conn'];
+      $counts[$nodeconcount] = $node;
+   }
+   
+   #firgure out what node has the least number of connections.   
+   $lowest = array.sortNumerical( hash.keys( $counts ))[0];
+   $usingnode = $counts[$lowest];
+   pool.select( "Traffic Script Web Servers", $usingnode, request.getDestPort() );
+   data.set( "busynode", $usingnode );
+}
+
+#clear the global data
+if( $path == $report && $rulestate == "RESPONSE" ){
+   data.remove( "busynode" );
+}
