@@ -1,0 +1,198 @@
+### Notes
+# 
+#  - This rule stores an encrypted string of the username and IP address in a client side cookie.
+#  - The client side cookie is set with auth ok from the form post action.
+#  - The Credentials in memory are stored encrypted
+#  - The encryption password uses a combination of the passphrase and the client ip address.
+#  - The cookie data is used to retrive the submitted credentials from memory
+#  - Credentials from memory are used to set the basic auth header for the application.
+#  - This rule uses timeout values and the client ip to verify auth. 
+#    if the client ip or timeout expires the logon form will be sent to the client. 
+#  - In additon to User options below, check the rule for "optional" text lines.
+#
+###
+
+### User options
+#
+# timeout in seconds for global data to reset auth
+$timelimit = 3600;
+# interval in sec, the creds are checked against LDAP, a value of 0 will disable interval checks
+$checkinterval = 600;
+# name of client side cookie
+$cookie = ( "tssession" );
+$passphrase = ( "!@#Ch@ng3m3123" );
+#
+# named authenticator from the Catalog > Authenticators page
+$ldapserver = ( "MS-AD" );
+#
+# Login page font
+$fontface = ( "Tahoma" );
+#
+# If using the Application Firewall Hide Basic Auth Handler
+# this will send the login page with the default handler setting. 
+if ( http.getPath() == "/public/login.html" ) promptAuthHttpForm();
+#
+#
+###
+
+# Get the clients ip address. 
+$clientip = request.getRemoteIP();
+# If they came via a proxy, and X-Forwarded-For header is a valid ip address.
+# use the X-Forwarded-For header value
+$proxy = http.getHeader( "X-Forwarded-For" );
+if( $proxy != "" ) {
+   $isvalidip = string.validIPAddress( $proxy );
+   if( $isvalidip == 4 || $isvalidip == 6 ) { 
+      $clientip = $proxy;
+   }
+}
+
+# append the client ip to the passphrase
+#  optional, *the ip is also going to be used in the string.encrypt functions
+$passphrase .= ( $clientip );
+
+$now = sys.time();
+
+### POST INSPECTION
+if ( http.getMethod() == "POST" && http.doesFormParamExist( "action" )) {
+   $username = http.getFormParam( "username" );
+   $password = http.getFormParam( "password" );
+   # check non empty credentials against LDAP
+   if( $username != "" && $password != "" 
+      ## optional check for password length, remove "#" below
+      #&& string.length( $password >= "3" )
+      ## optional check for username length, remove "#" below 
+      #&& string.length( $username >= "3" )
+      ){
+      checkLDAP( $username , $password );
+      # If LDAP was successful
+      if( $auth['OK'] ) {
+         $userpass = string.base64encode( $username.":".$password );
+         # Create a data aray 
+         #  0=inital time stamp, 1=user:pass, 2=client side "hash", 3=last interval time stamp
+         $userdata = [  $now ,
+                    # base64 username:password encrypted with phrase and cIP
+                    string.encrypt( $userpass, $passphrase . $clientip ) ,
+                    # string of username and IP, encrypted with phrase and cIP
+                    #  "hash" or the data that would be stored on the client cookie
+                    string.encrypt( $username . $clientip, $passphrase . $clientip ),
+                    $now ];
+         
+         # Store the data array to global memory,
+         # consider using data.local.set for better performance.
+         data.set ( $username , $userdata );
+         #Set the encrypted cookie with the passphrase, add the Authorization header
+         http.setResponseCookie ( $cookie , string.encrypt( $username . $clientip , $passphrase . $clientip ));
+         http.addHeader( "Authorization", "Basic ".$userpass );
+         #change the path and method to get response data from OW
+         http.setBody( "" );
+         http.setMethod( "GET" );
+      }  
+   }    
+}
+
+### Cookie & Global Data inspection
+$cookie = http.getcookie( $cookie );
+
+if( $cookie != "" ) {
+   #decrypt the cookie data
+   $cookie = string.decrypt( $cookie, $passphrase . $clientip );
+   # Check if decryption failed, remove cookie and send logon
+   if ( $cookie == "" ) {
+      #Send the logon
+      promptAuthHttpForm();
+   }
+   # Get the global data
+   # *consider using data.local.get for better performance.
+   $userdata = data.get( $username );
+   # if the user data was empty
+   # Check if the decrypted cookie does not match the global data username "hash"
+   # Check if global data entry has expired
+   if ( $userdata == "" || $cookie != $userdata[2] || ( $now - $userdata[0] ) > $timelimit ) {
+      #clear the global data
+      data.remove( $username );
+      #Send the logon
+      promptAuthHttpForm();
+   }
+   
+   # use the cookie data for the username 
+   $username = string.replace($cookie, $clientip , "");
+   #use global data to set the basic auth header.
+   $userpass = string.decrypt( $userdata[1], $passphrase . $clientip );
+
+   #if global data decryption failed send logon
+   if ( $userpass == "" ) {
+      data.remove( $username );
+      promptAuthHttpForm();
+   }
+   #Check timeout settings for interval check
+   if ( $checkinterval != "0" && (  $now - $userdata[3] ) > $timelimit )  {
+      # Check the credentials against the global data
+      $up = string.split( $userpass, ";" );
+      checkLDAP( $up[0] , $up[1]);
+      # If the sub did not send a response to the client auth passed
+      # Update the interval array
+      $userdata[3] = $now;
+      # Store the array to global memory,
+      # *consider using data.local.set for better performance.
+      data.set ( $username , $userdata );
+      
+   }
+   # All checks against cookie and global data have passed. 
+   # Set the basic Auth header with the credentials from the global data. 
+   http.addHeader( "Authorization", "Basic ".$userpass );
+}
+
+else {
+   #Send the logon form
+   promptAuthHttpForm();
+}
+
+###BEGIN SUB's
+
+sub checkLDAP( $username, $password){
+   #If credentials are NOT empty
+   if( $username != "" && $password != "" ){
+      $auth= auth.query( $ldapserver, $username, $password );
+      #If the credentials pass
+      if( $auth['OK'] ) {
+         return $auth;
+      }
+      #If a problem with LDAP
+      if( $auth['Error'] ) {
+         #write to the event log
+         log.error( "OWA Connection Dropped - Error with Authenticator 'MS-AD' Details: ".$auth['Error'] );
+         #send an error to the client
+         http.sendResponse( "503 Service Unavailable", "text/html", "Service Unavailable","Retry-After: 300");
+         #drop the connection.
+         connection.discard();
+      }
+      #If a problem with logon credentials
+      if( !$auth['OK'] ) {
+         #log.error( "Unauthorized access - Failed Logon from ". request.getRemoteIP() );
+         #optional, you could send the promptAuthHttpForm form
+         #promptAuthHttpForm();
+         #Send the client a 401
+         http.sendResponse( "401 Permission Denied",
+         "text/html", 'Incorrect username or password, please try again. Unauthorized access is logged.',
+         "Retry-After: 10");
+      }
+   } else {
+   #Send the logon form
+   promptAuthHttpForm();
+   }
+}
+
+sub promptAuthHttpForm(){
+   http.removecookie( $cookie );
+   $host = http.getHostHeader();
+   http.sendResponse(200, "text/html", '<!DOCTYPE html><head><title>'.$host.' Login</title><style>
+   body{text-align: center; font-family: '.$fontface.'}</style></head><body><form method="POST" 
+   action="https://'.$host.'"><BR><b>'.$host.'</b><BR><BR>Please Login<BR>
+   <BR>Username <input type="text" name="username"><BR> Password <input type="password" name="password"><BR>
+   <input type="hidden" name="action" value="login"><input type="submit" value="Submit"></form>
+   <BR><small>This system may be accessed and used by authorized personnel only.<BR>
+   All activities are subject to monitoring. Unauthorized use is *STRICTLY PROHIBITED*.<BR>
+   Intentional misuse of this system can result in disciplinary action or criminal prosecution. 
+   </small></body>', "");
+}
